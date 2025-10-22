@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    conn = sqlite3.connect('myeloma_reports_de.sqlite')
+    conn = sqlite3.connect('database/base_database.sqlite')
 
     # Get table info
     tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -27,7 +27,7 @@ def index():
 
 @app.route('/table/<table_name>')
 def show_table(table_name):
-    conn = sqlite3.connect('myeloma_reports_de.sqlite')
+    conn = sqlite3.connect('database/base_database.sqlite')
 
     # Get column info
     columns = conn.execute(f"PRAGMA table_info({table_name})").fetchall()

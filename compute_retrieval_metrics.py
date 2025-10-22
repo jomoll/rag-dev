@@ -216,6 +216,156 @@ def ndcg_at_k(rel_lists: List[List[int]], k: int) -> float:
         total += (dcg / idcg) if idcg > 0 else 0.0
     return total / max(1, len(rel_lists))
 
+# -------- BM25 additions (char-3gram tokenizer; simple in-memory index) --------
+
+def _normalize_text(s: str) -> str:
+    return (s or "").lower()
+
+def _char_ngrams(s: str, n: int = 3) -> List[str]:
+    s = re.sub(r"[^0-9a-zA-ZäöüÄÖÜß]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.replace(" ", "_")  # keep some boundary info
+    if len(s) < n:
+        return [s] if s else []
+    return [s[i:i+n] for i in range(len(s)-n+1)]
+
+class BM25Index:
+    def __init__(self, k1: float = 1.2, b: float = 0.75, ngram: int = 3):
+        self.k1 = k1
+        self.b = b
+        self.ngram = ngram
+        self.df = Counter()
+        self.doc_len = []
+        self.avgdl = 0.0
+        self.N = 0
+        self.postings: Dict[str, Dict[int, int]] = defaultdict(dict)
+
+    def add_docs(self, docs: List[str]):
+        self.N = len(docs)
+        for doc_id, text in enumerate(docs):
+            toks = _char_ngrams(_normalize_text(text), self.ngram)
+            tf = Counter(toks)
+            self.doc_len.append(sum(tf.values()))
+            for t, c in tf.items():
+                self.df[t] += 1
+                self.postings[t][doc_id] = c
+        self.avgdl = (sum(self.doc_len) / max(1, self.N)) if self.N else 0.0
+
+    def score(self, query: str, cand_mask: np.ndarray) -> np.ndarray:
+        toks = _char_ngrams(_normalize_text(query), self.ngram)
+        unique_q = set(toks)
+        # precompute IDF
+        idf = {}
+        for t in unique_q:
+            df_t = self.df.get(t, 0)
+            # standard BM25 IDF with +0.5 smoothing
+            idf[t] = math.log((self.N - df_t + 0.5) / (df_t + 0.5) + 1.0) if self.N else 0.0
+
+        idxs = np.nonzero(cand_mask)[0]
+        scores = np.zeros(len(idxs), dtype=np.float32)
+        for j, doc_id in enumerate(idxs):
+            dl = self.doc_len[doc_id] if doc_id < len(self.doc_len) else 0
+            denom_norm = self.k1 * (1 - self.b + self.b * (dl / self.avgdl)) if self.avgdl > 0 else self.k1
+            s = 0.0
+            for t in unique_q:
+                tf = self.postings.get(t, {}).get(doc_id, 0)
+                if tf == 0:
+                    continue
+                num = tf * (self.k1 + 1.0)
+                s += idf[t] * (num / (tf + denom_norm))
+            scores[j] = s
+        return scores
+
+def evaluate_bm25_model(
+    conn: sqlite3.Connection,
+    qa: List[dict],
+    topk: List[int] = [1,5,10,20],
+    restrict_same_report: bool = False,
+    restrict_same_patient: bool = True,
+    ngram: int = 3,
+    k1: float = 1.2,
+    b: float = 0.75
+) -> Dict[str, float]:
+    # Load corpus: section_id, report_id, section_name, text, patient_id
+    rows = conn.execute("""
+      SELECT rs.section_id, rs.report_id, UPPER(rs.name) AS section_name, rs.text AS text, r.patient_id
+      FROM report_sections rs
+      JOIN reports r ON r.report_id = rs.report_id
+      WHERE rs.text IS NOT NULL AND LENGTH(rs.text) > 0
+    """).fetchall()
+
+    if not rows:
+        print("BM25: no documents found")
+        return {}
+
+    docs = [r["text"] for r in rows]
+    sec_ids = np.array([r["section_id"] for r in rows])
+    rep_ids = np.array([r["report_id"] for r in rows], dtype=object)
+    sec_names = np.array([(r["section_name"] or "UNKNOWN") for r in rows], dtype=object)
+    pat_ids = np.array([r["patient_id"] for r in rows], dtype=object)
+
+    bm25 = BM25Index(k1=k1, b=b, ngram=ngram)
+    bm25.add_docs(docs)
+
+    # Map gold section ids to row indices
+    idx_by_sec = {}
+    for i, sid in enumerate(sec_ids):
+        idx_by_sec[int(sid)] = i
+
+    all_ranks = []
+    rel_lists_at_maxk = []
+    top1_section_match = 0
+    Kmax = max(topk)
+
+    for q in qa:
+        gold_rows = [idx_by_sec[sid] for sid in q["gold_chunk_ids"] if sid in idx_by_sec]
+        mask = np.ones(len(sec_ids), dtype=bool)
+        if restrict_same_patient and q.get("patient_id"):
+            mask &= (pat_ids == q["patient_id"])
+        if restrict_same_report and q.get("gold_report_id"):
+            mask &= (rep_ids == q["gold_report_id"])
+
+        if not np.any(mask):
+            all_ranks.append(None)
+            rel_lists_at_maxk.append([0]*Kmax)
+            continue
+
+        scores = bm25.score(q["question"], mask)
+        order = np.argsort(-scores)
+        top_idx_local = order[:Kmax]
+        cand_indices = np.nonzero(mask)[0]
+        top_rows = cand_indices[top_idx_local]
+
+        gold_set = set(gold_rows)
+        rr = None
+        rel_list = []
+        for rank, r_i in enumerate(top_rows):
+            rel = 1 if r_i in gold_set else 0
+            rel_list.append(rel)
+            if rr is None and rel:
+                rr = rank
+        all_ranks.append(rr)
+        rel_lists_at_maxk.append(rel_list[:Kmax])
+
+        if len(top_rows) > 0:
+            if sec_names[top_rows[0]] == q["gold_section_name"]:
+                top1_section_match += 1
+
+    results = {
+        'queries_evaluated': len(qa),
+        'queries_with_gold': sum(1 for rr in all_ranks if rr is not None),
+        'embedding_count': len(sec_ids),  # to fit the table
+        'embedding_col': 'embedding_bm25_char3',
+        'section_accuracy': top1_section_match / len(qa) if qa else 0.0
+    }
+    for k in topk:
+        results[f"recall@{k}"] = recall_at_k(all_ranks, k)
+        results[f"ndcg@{k}"] = ndcg_at_k(rel_lists_at_maxk, k)
+    results["mrr"] = mrr(all_ranks)
+    return results
+
+# -------------------------------------------------------------------------------
+
 def evaluate_dense(
     conn: sqlite3.Connection,
     embedder: Embedder,
@@ -659,7 +809,23 @@ def evaluate_all_models(
         except Exception as e:
             print(f"Error evaluating {embedding_col}: {e}")
             continue
-    
+
+    # Add BM25 as another row in the comparison, unchanged pipeline otherwise
+    print(f"\n{'='*60}")
+    print("EVALUATING MODEL: embedding_bm25_char3")
+    print(f"{'='*60}")
+    try:
+        bm25_results = evaluate_bm25_model(
+            conn, qa,
+            topk=topk,
+            restrict_same_report=restrict_same_report,
+            restrict_same_patient=restrict_same_patient
+        )
+        if bm25_results:
+            all_results['embedding_bm25_char3'] = bm25_results
+    except Exception as e:
+        print(f"Error evaluating BM25: {e}")
+
     # Print comparison table
     print_comparison_table(all_results, topk)
 
