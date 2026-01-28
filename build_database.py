@@ -11,6 +11,7 @@ import hashlib
 import datetime
 import re
 import csv
+import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from tqdm import tqdm
@@ -104,7 +105,7 @@ def extract_date_from_filename(filename: str) -> Optional[str]:
             if len(year) == 2:
                 year_int = int(year)
                 # Assume years 00-30 are 2000s, 31-99 are 1900s
-                if year_int <= 30:
+                if year_int <= 25:
                     year = f"20{year}"
                 else:
                     year = f"19{year}"
@@ -119,15 +120,15 @@ def extract_date_from_filename(filename: str) -> Optional[str]:
     return None
 
 def extract_report_type_from_filename(filename: str) -> str:
-    """Extract report type from parentheses in filename"""
-    # Look for text in parentheses
-    match = re.search(r'\(([^)]+)\)', filename)
-    if match:
-        content = match.group(1).strip()
-        # Only accept specific report types
-        if content in ["Arztbrief", "Cytologie", "Flow cytometry"]:
-            return content
-    
+    """Extract report type from anywhere in the filename (case-insensitive)"""
+    report_types = [
+        "Arztbrief", "Cytologie", "Flow cytometry", "Cytology", "Flow",
+        "Path", "Beschluss", "RAD", "labor"
+    ]
+    lower_filename = filename.lower()
+    for rtype in report_types:
+        if rtype.lower() in lower_filename:
+            return rtype
     # Default to "Arztbrief" for everything else
     return "Arztbrief"
 
@@ -208,44 +209,52 @@ def insert_report(conn: sqlite3.Connection, patient_id: str, report_id: str, fil
 
 def process_patient_directory(conn: sqlite3.Connection, patient_dir: Path, 
                             patient_roster: Dict[str, Dict[str, str]]):
-    """Process all .md files in a patient directory"""
+    """Process all .md and .json files in a patient directory"""
     patient_id = patient_dir.name
     patient_info = patient_roster.get(patient_id, {
         'firstname': '', 'lastname': '', 'fullname': '', 'dob': ''
     })
     
-    # Upsert patient info
     upsert_patient(conn, patient_id, patient_info)
-    
     processed_count = 0
     duplicate_count = 0
-    
-    # Process all .md files
-    for md_file in patient_dir.glob("*.md"):
+
+    # Process all .md and .json files, including subdirectories
+    for file in patient_dir.rglob("*"):
+        if not file.is_file():
+            continue
         try:
-            # Read file content
-            content = md_file.read_text(encoding='utf-8', errors='ignore').strip()
+            if file.suffix == ".md":
+                content = file.read_text(encoding='utf-8', errors='ignore').strip()
+            elif file.suffix == ".json":
+                with file.open("r", encoding="utf-8") as f:
+                    json_data = json.load(f)
+                # You can customize this to extract what you want from the JSON
+                content = json.dumps(json_data, ensure_ascii=False, indent=2)
+            else:
+                continue
+
             if not content:
                 continue
-            
-            # Extract metadata
-            filename = md_file.name
+
+            filename = file.name
             report_type = extract_report_type_from_filename(filename)
             report_date = extract_date_from_filename(filename)
             report_id = safe_report_id(filename, patient_id)
-            
-            # Insert report
-            success, was_duplicate = insert_report(conn, patient_id, report_id, filename, content, 
-                                                 str(md_file), report_type, report_date)
+
+            success, was_duplicate = insert_report(
+                conn, patient_id, report_id, filename, content, 
+                str(file), report_type, report_date
+            )
             if success:
                 processed_count += 1
             elif was_duplicate:
                 duplicate_count += 1
-                
+
         except Exception as e:
-            print(f"[ERROR] Processing {md_file}: {e}")
+            print(f"[ERROR] Processing {file}: {e}")
             continue
-    
+
     return processed_count, duplicate_count
 
 def build_database(base_folder: str, csv_path: str, db_path: str):
@@ -333,4 +342,3 @@ if __name__ == "__main__":
     db_path = sys.argv[3]
     
     build_database(base_folder, csv_path, db_path)
-

@@ -11,9 +11,12 @@ from typing import List, Tuple
 from tqdm import tqdm
 
 def init_sections_table(conn: sqlite3.Connection):
-    """Create the report_sections table and FTS index"""
+    """Drop and create the report_sections table and FTS index"""
     
     conn.executescript("""
+    DROP TABLE IF EXISTS report_sections;
+    DROP TABLE IF EXISTS sections_fts;
+
     CREATE TABLE IF NOT EXISTS report_sections(
         section_id TEXT PRIMARY KEY,
         report_id TEXT NOT NULL,
@@ -134,6 +137,26 @@ def generate_section_id(report_id: str, section_name: str, section_order: int) -
     clean_name = re.sub(r'[^A-Za-z0-9._-]', '_', section_name)[:30]
     return f"{report_id}_sec_{section_order:03d}_{clean_name}"
 
+def split_section_with_overlap(section_name: str, section_content: str, max_words: int = 350, overlap: int = 50):
+    """Split section content into chunks with overlap if longer than max_words"""
+    words = section_content.strip().split()
+    if len(words) <= max_words:
+        return [(section_name, section_content)]
+    chunks = []
+    start = 0
+    chunk_id = 1
+    while start < len(words):
+        end = min(start + max_words, len(words))
+        chunk_words = words[start:end]
+        chunk_text = ' '.join(chunk_words)
+        chunk_name = f"{section_name} (part {chunk_id})"
+        chunks.append((chunk_name, chunk_text))
+        if end == len(words):
+            break
+        start = end - overlap
+        chunk_id += 1
+    return chunks
+
 def process_report_sections(conn: sqlite3.Connection, db_path: str):
     """Process all reports and extract sections"""
     
@@ -157,44 +180,49 @@ def process_report_sections(conn: sqlite3.Connection, db_path: str):
         
         if not content or not content.strip():
             continue
+
+        # Skip "labor" reports (JSON lab values)
+        if report_type and report_type.lower() == "labor":
+            continue
             
         # Extract and merge sections
         raw_sections = extract_sections(content)
         merged_sections = merge_small_sections(raw_sections, min_words=50)
         
+        # If no sections found, treat the whole report as a single section
         if not merged_sections:
-            continue
+            merged_sections = [("Full report", content.strip())]
             
         # Insert sections
         for section_order, (section_name, section_content) in enumerate(merged_sections, 1):
-            section_id = generate_section_id(report_id, section_name, section_order)
-            word_count = len(section_content.strip().split())
-            
-            # Insert into report_sections table
-            conn.execute("""
-                INSERT OR REPLACE INTO report_sections(
-                    section_id, report_id, patient_id, section_name, section_content,
+            # Split if section is too long
+            split_sections = split_section_with_overlap(section_name, section_content, max_words=350, overlap=50)
+            for split_idx, (split_name, split_content) in enumerate(split_sections, 1):
+                section_id = generate_section_id(report_id, split_name, section_order * 1000 + split_idx)
+                word_count = len(split_content.strip().split())
+                # Insert into report_sections table
+                conn.execute("""
+                    INSERT OR REPLACE INTO report_sections(
+                        section_id, report_id, patient_id, section_name, section_content,
+                        section_order, word_count, filename, report_type, report_date,
+                        created_at, source_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    section_id, report_id, patient_id, split_name, split_content,
                     section_order, word_count, filename, report_type, report_date,
                     created_at, source_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                section_id, report_id, patient_id, section_name, section_content,
-                section_order, word_count, filename, report_type, report_date,
-                created_at, source_path
-            ))
-            
-            # Insert into FTS index
-            conn.execute("""
-                INSERT OR REPLACE INTO sections_fts(
-                    section_id, report_id, patient_id, section_name, 
-                    filename, report_type, section_content
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                section_id, report_id, patient_id, section_name,
-                filename, report_type, section_content
-            ))
-            
-            total_sections += 1
+                ))
+                # Insert into FTS index
+                conn.execute("""
+                    INSERT OR REPLACE INTO sections_fts(
+                        section_id, report_id, patient_id, section_name, 
+                        filename, report_type, section_content
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    section_id, report_id, patient_id, split_name,
+                    filename, report_type, split_content
+                ))
+                total_sections += 1
         
         processed_reports += 1
         
